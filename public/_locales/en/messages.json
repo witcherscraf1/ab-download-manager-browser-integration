@@ -1,12 +1,12 @@
 {
   "selection_popup_download_selected": {
-    "message": "Download Selected"
+    "message": "Download selected"
   },
   "popup_alert_no_link_detected": {
     "message": "No links detected"
   },
   "popup_alert_nothing_selected": {
-    "message": "Please first select a section"
+    "message": "Please first make a selection"
   },
   "context_menu_download_with_abdm": {
     "message": "Download with AB DM"
@@ -33,7 +33,7 @@
     "message": "Auto Capture Links"
   },
   "config_auto_capture_links_description": {
-    "message": "When you click on link on your browser the link will automatically captured for download by the App"
+    "message": "When you click on a link in your browser it will automatically be captured for download by the app"
   },
   "reset_to_default": {
     "message": "Reset to default"
@@ -45,19 +45,19 @@
     "message": "Enter URLs you don't want to be captured (one per line, wildcards (*) supported)"
   },
   "config_silent_add_download": {
-    "message": "Add Downloads Silently"
+    "message": "Add downloads silently"
   },
   "config_silent_add_download_description": {
     "message": "Automatically add captured downloads to the download list without showing the \"Add Download\" window"
   },
   "config_silent_start_download": {
-    "message": "Start Download Silently"
+    "message": "Start download silently"
   },
   "config_silent_start_download_description": {
     "message": "Automatically start captured downloads without showing the \"Add Download\" window"
   },
   "config_show_popups": {
-    "message": "Show Popups"
+    "message": "Show popups"
   },
   "config_show_popups_description": {
     "message": "Show popup on selections which have links"
@@ -66,7 +66,7 @@
     "message": "Port"
   },
   "config_port_description": {
-    "message": "Make sure this port and the value in app are the same otherwise this extension not works properly"
+    "message": "Make sure this port and the value in the app are the same otherwise this extension will not work properly"
   },
   "config_port_connection_success": {
     "message": "Success\nPort ($port$) Is connected",
@@ -90,16 +90,16 @@
     "message": "Send Cookies"
   },
   "config_send_cookies_descrption": {
-    "message": "Note: DON'T Check this if you are in a non trustable environment"
+    "message": "Note: DON'T check this if you are in a non-trusted environment"
   },
   "browser_action_more_settings": {
-    "message": "More Settings"
+    "message": "More settings"
   },
   "connection_error_api_error": {
-    "message": "There is a problem with app api, Make sure to update both app and extension to latest version"
+    "message": "There is a problem with the app api, make sure to update both the app and extension to the latest version"
   },
   "connection_error_network_error": {
-    "message": "Can't connect to Application, Please make sure the app is installed and running and also the Browser Integration is turned On in the application settings"
+    "message": "Can't connect to the application, please make sure the app is installed and running. Also ensure the Browser Integration feature is turned On in the application settings"
   },
   "settings": {
     "message": "Settings"
@@ -108,7 +108,7 @@
     "message": "Test"
   },
   "note_about_app_must_be_installed_first": {
-    "message": "In order to this extension work properly,Make sure AB Download Manager is installed if it doesn't..."
+    "message": "In order for this extension to work properly, make sure AB Download Manager is installed, if it doesn't..."
   },
   "download_abdm_app": {
     "message": "Download The App"
@@ -117,7 +117,7 @@
     "message": "Project Website"
   },
   "support_by_rating": {
-    "message": "If you like this work, Don't forget to support me by your comments/ratings and also share it with your friends"
+    "message": "If you like this work, don't forget to support me by your comments/ratings and also share it with your friends"
   },
   "project_source_code": {
     "message": "Project Source Code"
