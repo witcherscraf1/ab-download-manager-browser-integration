@@ -1,15 +1,27 @@
 import {DownloadRequestHeaders, DownloadRequestItem} from "~/interfaces/DownloadRequestItem";
-import {sendMessage} from "webext-bridge/options";
+import browser from "webextension-polyfill";
 import * as Configs from "~/configs/Config"
 
 export async function addDownloads(downloadItems: Array<DownloadRequestItem>) {
     if (Configs.getLatestConfig().sendHeaders) {
-        const headersOfLinks = await sendMessage("get_headers", downloadItems.map(i => i.link))
+        const headersOfLinks = await browser.runtime.sendMessage({
+            type: "get_headers",
+            data: downloadItems.map((item) => ({
+                url: item.link,
+                downloadPage: item.downloadPage,
+            })),
+        })
         downloadItems = downloadItems.map((value, index) => {
-            // some download items might have headers so we use them instead
+            const fetchedHeaders = headersOfLinks[index] ?? null
             return {
                 ...value,
-                headers: value.headers ?? headersOfLinks[index],
+                // Merge captured request headers with page-derived fallback headers so
+                // the downloader gets Referer/Origin/Cookie even when the intercepted
+                // request did not include every header we care about.
+                headers: fetchedHeaders ? {
+                    ...fetchedHeaders,
+                    ...(value.headers ?? {}),
+                } : (value.headers ?? null),
             } as DownloadRequestItem
         })
     } else {
@@ -20,5 +32,5 @@ export async function addDownloads(downloadItems: Array<DownloadRequestItem>) {
             } as DownloadRequestItem
         })
     }
-    await sendMessage("add_download", downloadItems, "background")
+    await browser.runtime.sendMessage({type: "add_download", data: downloadItems})
 }

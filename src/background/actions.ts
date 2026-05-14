@@ -36,14 +36,23 @@ export async function addDownload(
     return response
 }
 
-export async function getHeadersForUrls(urls: string[]) {
-    return Promise.all(urls.map(async url => {
-        return await getHeadersForUrl(url)
+type HeaderLookupInput = string | {
+    url: string,
+    downloadPage?: string | null,
+}
+
+export async function getHeadersForUrls(inputs: HeaderLookupInput[]) {
+    return Promise.all(inputs.map(async input => {
+        if (typeof input === "string") {
+            return await getHeadersForUrl(input)
+        }
+        return await getHeadersForUrl(input.url, input.downloadPage ?? null)
     }));
 }
 
 export async function getHeadersForUrl(
     url: string,
+    downloadPage: string | null = null,
 ): Promise<DownloadRequestHeaders | null> {
     try {
         let headers: DownloadRequestHeaders = {}
@@ -55,6 +64,14 @@ export async function getHeadersForUrl(
         headers["Cookie"] = cookie
         headers["Host"] = new URL(url).host
         headers["User-Agent"] = navigator.userAgent
+        if (downloadPage) {
+            headers["Referer"] = downloadPage
+            try {
+                headers["Origin"] = new URL(downloadPage).origin
+            } catch (e) {
+                // ignore malformed page URL
+            }
+        }
         return headers
     } catch (e) {
         console.log(e)

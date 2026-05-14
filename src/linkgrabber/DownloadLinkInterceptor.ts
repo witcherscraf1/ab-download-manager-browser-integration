@@ -7,13 +7,14 @@ import {run} from "~/utils/ScopeFunctions";
 import type {Tabs, WebRequest} from "webextension-polyfill";
 import browser from "webextension-polyfill";
 import {isChrome} from "~/utils/ExtensionInfo";
-import urlMatch from "match-url-wildcard"
 import {InterceptedMediaResult,} from "~/linkgrabber/LinkGrabberResponse";
 
 import {OnMediaInterceptedFromRequestListener} from "~/media/OnMediaInterceptedFromRequestListener";
+import {matchesUrlPattern} from "~/utils/UrlBlocker";
 import {MEDIA_BLACKLIST_URLS} from "~/media/MediaBlackList";
 import {getContentType, getContentLength} from "~/utils/HeaderUtils";
 import {getFileExtension, getFileFromHeaders, getFileFromUrl} from "~/utils/URLUtils";
+import {HLS_CONTENT_TYPES} from "~/media/HLSUtils";
 
 type TabInfo = {
     title?: string,
@@ -51,7 +52,7 @@ export abstract class DownloadLinkInterceptor {
         if (blackList.length == 0) {
             return false
         }
-        return urlMatch(url, blackList)
+        return matchesUrlPattern(url, blackList)
     }
 
     protected isWebPageComponents(responseHeaders: Headers) {
@@ -67,14 +68,32 @@ export abstract class DownloadLinkInterceptor {
         requestHeaders: Headers,
         responseHeaders: Headers,
     ): InterceptedMediaResult | false {
-        // we only receive requests that have m3u8 so it should be fine
-        return {
-            type: "media",
-            mediaType: "hls",
-            url: url,
-            requestHeaders: requestHeaders,
-            responseHeaders: responseHeaders,
+        const contentType = getContentType(responseHeaders)
+        if (contentType) {
+            const isHLS = HLS_CONTENT_TYPES.some(type => contentType.toLowerCase().startsWith(type))
+            if (isHLS) {
+                return {
+                    type: "media",
+                    mediaType: "hls",
+                    url: url,
+                    requestHeaders: requestHeaders,
+                    responseHeaders: responseHeaders,
+                }
+            }
         }
+
+        // Fallback to URL check if content-type is generic or missing
+        const u = url.toLowerCase();
+        if (u.includes(".m3u8") || u.includes(".m3u")) {
+            return {
+                type: "media",
+                mediaType: "hls",
+                url: url,
+                requestHeaders: requestHeaders,
+                responseHeaders: responseHeaders,
+            }
+        }
+        return false
     }
 
     protected isDirectMedia(
@@ -86,7 +105,17 @@ export abstract class DownloadLinkInterceptor {
         if (!type) {
             return false
         }
-        for (const hlsType of ["video", "audio"]) {
+        const typesToCheck = ["video", "audio"]
+        try {
+            // if user enabled image capture by adding 'img' to registeredFileTypes,
+            // include image/* content types in detection
+            if (Configs.getLatestConfig().registeredFileTypes.includes('img')) {
+                typesToCheck.push('image')
+            }
+        } catch (e) {
+            // config may not be initialized in some edge cases; ignore
+        }
+        for (const hlsType of typesToCheck) {
             if (type.startsWith(hlsType)) {
                 return {
                     type: "media",
@@ -320,10 +349,8 @@ export abstract class DownloadLinkInterceptor {
             }, {
                 types: ["xmlhttprequest"],
                 urls: [
-                    "http://*/*.m3u8",
-                    "https://*/*.m3u8",
-                    "http://*/*.m3u8?*",
-                    "https://*/*.m3u8?*",
+                    "*://*/*.m3u8*",
+                    "*://*/*.m3u*",
                 ],
             },
             [
@@ -339,6 +366,35 @@ export abstract class DownloadLinkInterceptor {
         browser.webRequest.onHeadersReceived.addListener(
             async (details) => {
                 let shouldRemoveResponseInFinallyImmediately: boolean = true
+                // If resource is a media stream or XHR, try detection here as
+                // onCompleted may never fire for streaming playback or specific filters.
+                try {
+                    if (details.type === "media" || details.type === "xmlhttprequest") {
+                        const request = this.pendingRequests[details.requestId]
+                        if (request) {
+                            const hdrs = getHeaders(details.responseHeaders)
+                            const ct = hdrs.get("content-type")
+                            
+                            // Check for HLS first
+                            if (this.isHLSRequest(details.url, getHeaders(request.requestHeaders), hdrs)) {
+                                this.checkForHLS(details as WebRequest.OnCompletedDetailsType, request)
+                            } else if (details.type === "media") {
+                                try {
+                                    // cast is safe: checkForDirectMedia uses url, responseHeaders and tabId
+                                    this.checkForDirectMedia(details as WebRequest.OnCompletedDetailsType, request)
+                                } catch (e) {
+                                    console.error("[DL_INTERCEPT] media check failed", e)
+                                }
+                            }
+                        }
+                        if (details.type === "media") {
+                            // let media response pass through; we don't block here
+                            return this.passResponse()
+                        }
+                    }
+                } catch (e) {
+                    console.error("[DL_INTERCEPT] onHeadersReceived detection error", e)
+                }
                 try {
                     const result = this.shouldHandleRequestForDirectDownload(details);
                     this.responses[details.requestId] = details
@@ -433,10 +489,42 @@ export abstract class DownloadLinkInterceptor {
             getHeaders(details.responseHeaders),
         );
         if (isHLS) {
-            this.onMediaDetected(
-                details.tabId,
-                isHLS,
-            )
+            run(async () => {
+                const resolved = await resolveTabId(details)
+                if (resolved !== null && resolved >= 0) {
+                    logMediaTrigger("hls", details.url, resolved)
+                    this.onMediaDetected(resolved, isHLS)
+                } else {
+                    // store a minimal downloadable media fallback so content-script can show it later
+                    try {
+                        const origin = details.originUrl || getOriginFromUrl(details.url)
+                        if (origin) {
+                            const key = `abdm_pending_media_origin_${origin}`
+                            const item = createDownloadableMediaFallback(isHLS)
+                            // try to collect cookies for the origin to help authenticated downloads
+                            try {
+                                const u = new URL(details.url)
+                                const cookies = await browser.cookies.getAll({ domain: u.hostname })
+                                if (cookies && cookies.length > 0) {
+                                    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ')
+                                    item.requestHeaders = Object.assign({}, item.requestHeaders ?? {}, { Cookie: cookieHeader })
+                                }
+                            } catch (e) {
+                                // ignore cookie collection failures
+                            }
+                            const stored = await browser.storage.local.get(key)
+                            const arr = stored[key] ?? []
+                            arr.push(item)
+                            const rec: Record<string, any> = {}
+                            rec[key] = arr
+                            await browser.storage.local.set(rec)
+                            logMediaTrigger("hls-pending", details.url, -1)
+                        }
+                    } catch (e) {
+                        console.error("[DL_INTERCEPT] failed to store pending origin media", e)
+                    }
+                }
+            })
         }
     }
 
@@ -478,10 +566,40 @@ export abstract class DownloadLinkInterceptor {
             getHeaders(details.responseHeaders),
         );
         if (isMedia) {
-            this.onMediaDetected(
-                details.tabId,
-                isMedia,
-            )
+            run(async () => {
+                const resolved = await resolveTabId(details)
+                if (resolved !== null && resolved >= 0) {
+                    logMediaTrigger("direct-media", details.url, resolved)
+                    this.onMediaDetected(resolved, isMedia)
+                } else {
+                    try {
+                        const origin = details.originUrl || getOriginFromUrl(details.url)
+                        if (origin) {
+                            const key = `abdm_pending_media_origin_${origin}`
+                            const item = createDownloadableMediaFallback(isMedia)
+                            try {
+                                const u = new URL(details.url)
+                                const cookies = await browser.cookies.getAll({ domain: u.hostname })
+                                if (cookies && cookies.length > 0) {
+                                    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ')
+                                    item.requestHeaders = Object.assign({}, item.requestHeaders ?? {}, { Cookie: cookieHeader })
+                                }
+                            } catch (e) {
+                                // ignore cookie collection failures
+                            }
+                            const stored = await browser.storage.local.get(key)
+                            const arr = stored[key] ?? []
+                            arr.push(item)
+                            const rec: Record<string, any> = {}
+                            rec[key] = arr
+                            await browser.storage.local.set(rec)
+                            logMediaTrigger("direct-media-pending", details.url, -1)
+                        }
+                    } catch (e) {
+                        console.error("[DL_INTERCEPT] failed to store pending origin media", e)
+                    }
+                }
+            })
         }
     }
 
@@ -490,7 +608,7 @@ export abstract class DownloadLinkInterceptor {
         if (blackList.length == 0) {
             return false
         }
-        return urlMatch(url, blackList)
+        return matchesUrlPattern(url, blackList)
     }
 
     private updateTabCache(tab: Tabs.Tab) {
@@ -514,3 +632,66 @@ function getHeaders(responseHeaders?: browser.WebRequest.HttpHeaders): Headers {
     })
     return headers
 }
+
+async function resolveTabId(details: browser.WebRequest.OnCompletedDetailsDetailsType | any): Promise<number | null> {
+    try {
+        if (typeof details.tabId === 'number' && details.tabId >= 0) {
+            return details.tabId
+        }
+    } catch (e) {
+        // continue
+    }
+    const origin = details.originUrl || details.initiator || details.url
+    if (!origin) return null
+    try {
+        const urlObj = new URL(origin)
+        const originPattern = `${urlObj.origin}/*`
+        const tabs = await browser.tabs.query({ url: originPattern })
+        if (tabs && tabs.length > 0 && typeof tabs[0].id === 'number') {
+            return tabs[0].id
+        }
+    } catch (e) {
+        // ignore
+    }
+    return null
+}
+
+function getOriginFromUrl(url: string) {
+    try {
+        const u = new URL(url)
+        return u.origin
+    } catch (e) {
+        return null
+    }
+}
+
+function createDownloadableMediaFallback(result: any) {
+    try {
+        const file = getFileFromUrl(result.url) || ''
+        const ext = file ? getFileExtension(file) : undefined
+        const display = file || (new URL(result.url)).pathname.split('/').filter(Boolean).pop() || result.url
+        const headers = result.requestHeaders ? Object.fromEntries(result.requestHeaders.entries()) : undefined
+        return {
+            uri: result.url,
+            requestHeaders: headers,
+            displayName: display,
+            suggestedFullName: (file || display) + (ext ? '' : ''),
+            type: result.mediaType,
+            extension: ext
+        }
+    } catch (e) {
+        return {
+            uri: result.url,
+            requestHeaders: undefined,
+            displayName: result.url,
+            suggestedFullName: result.url,
+            type: result.mediaType
+        }
+    }
+}
+
+function logMediaTrigger(kind: string, url: string, tabId: number) {
+    const shortUrl = url.length > 140 ? `${url.slice(0, 140)}…` : url
+    console.info("[MEDIA_TRIGGER]", { kind, tabId, url: shortUrl })
+}
+
