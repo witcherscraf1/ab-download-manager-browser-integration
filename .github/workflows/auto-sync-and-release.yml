@@ -1,0 +1,79 @@
+name: Auto Sync & Release
+
+on:
+  schedule:
+    # 每月1号 UTC 时间 2:00 运行（北京时间 10:00）
+    - cron: "0 2 1 * *"
+  workflow_dispatch:  # 允许手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/amir1376/ab-download-manager-browser-integration.git
+          git fetch upstream
+
+      - name: Merge upstream changes
+        id: merge
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge upstream/master --no-edit --no-ff
+          echo "merged=true" >> $GITHUB_OUTPUT
+
+      - name: Handle merge conflict
+        if: steps.merge.outcome == 'failure'
+        run: |
+          echo "Merge conflict detected — aborting merge to avoid broken state."
+          git merge --abort
+          echo "conflict=true" >> $GITHUB_OUTPUT
+
+      - name: Build
+        if: steps.merge.outcome == 'success'
+        run: |
+          npm run build
+          npm run pack
+
+      - name: Determine version tag
+        if: steps.merge.outcome == 'success'
+        id: version
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          DATE=$(date +%Y%m%d)
+          echo "tag=v${VER}-auto-${DATE}" >> $GITHUB_OUTPUT
+
+      - name: Push merged changes
+        if: steps.merge.outcome == 'success'
+        run: git push origin master
+
+      - name: Create Release
+        if: steps.merge.outcome == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Auto Build ${{ steps.version.outputs.tag }}"
+          body: "Automated build from upstream changes."
+          files: |
+            dist/chrome.zip
+            dist/firefox.zip
+            dist/src.zip

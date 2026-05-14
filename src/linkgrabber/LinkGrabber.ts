@@ -18,4 +18,5 @@ export function redirectDownloadLinksToMe() {
     })
     downloadLinkInterceptor.redirectDownloadsToExtension()
     downloadLinkInterceptor.setOnMediaDetectedListener(downloadMediaRegistry)
+    return downloadMediaRegistry
 }

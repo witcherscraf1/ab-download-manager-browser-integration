@@ -1,10 +1,49 @@
 import {DownloadableMedia} from "~/media/MediaOnTab"
 import browser from "webextension-polyfill"
+import * as Configs from "~/configs/Config"
+import {isUrlBlacklisted} from "~/utils/UrlBlocker"
 
 let popupEl: HTMLDivElement | null = null
-let dismissed = false
+let pinnedPopupEl: HTMLDivElement | null = null
+let pinnedAnchorEl: HTMLElement | null = null
+let pinnedObserver: IntersectionObserver | null = null
+let pinnedScrollHandler: (() => void) | null = null
+let pinnedPositionUpdater: (() => void) | null = null
+let pinnedMode = false
 let listVisible = false // start collapsed
 let onItemClick: ((item: DownloadableMedia) => void) | undefined
+let lastHoverTarget: HTMLElement | null = null
+let hoverEnabled = true
+let lastMouseX: number | null = null
+let lastMouseY: number | null = null
+let blindZoneRadius = 120 // pixels
+let blindZoneRect: {left:number, top:number, right:number, bottom:number} | null = null
+let hoverExpansion = 1.4 // expand target hit-area vertically by this factor (more tolerant)
+const moveThreshold = 12 // minimum mouse move (px) to re-evaluate
+const hoverGraceMs = 600 // wait before clearing hover target when mouse leaves
+let hoverClearTimeout: number | null = null
+// popup/overlay hide behavior
+const hideAfterMouseLeaveMs = 2000 // ms to hide popup/overlay after leaving media
+let popupHideTimer: number | null = null
+
+function clearPopupHide() {
+  if (popupHideTimer) { window.clearTimeout(popupHideTimer); popupHideTimer = null }
+}
+
+function schedulePopupHide(ms = hideAfterMouseLeaveMs) {
+  if (pinnedMode) return
+  clearPopupHide()
+  popupHideTimer = window.setTimeout(() => {
+    try { if (popupEl) { popupEl.remove(); popupEl = null } } catch (e) {}
+    // also clear overlays unless keepPopupOpen
+    // overlays removed: no-op
+    popupHideTimer = null
+  }, ms)
+}
+
+let keepPopupOpen = false // when user selects an item, keep popup visible
+
+/* overlay-based small controls removed: using the main popup anchored to media instead */
 
 /**
  * Create the main popup element
@@ -14,10 +53,12 @@ function createPopup() {
     const downloadMediaTitle = browser.i18n.getMessage("download_media_title")
     const wrapper = document.createElement("div")
     wrapper.className = "abdm-extension"
+    // mark extension UI so hover detector can ignore our elements
+    wrapper.setAttribute('data-abdm-ignore', '1')
     wrapper.style.position = "fixed"
-    wrapper.style.top = "8px"
-    wrapper.style.left = "8px"
-    wrapper.style.zIndex = "999999"
+    wrapper.style.top = "-9999px"
+    wrapper.style.left = "-9999px"
+    wrapper.style.zIndex = "2147483647"
     wrapper.style.display = "flex"
     wrapper.style.flexDirection = "column"
     wrapper.style.alignItems = "start"
@@ -36,16 +77,15 @@ function createPopup() {
         align-items: center;
         justify-content: space-between;
         gap: 8px;
-        border-radius: 16px;
-        padding: 6px 12px;
+        border-radius: 10px;
+        padding: 6px 8px;
         background: linear-gradient(to bottom right, #2E3038, #171820);
-        border: rgba(255,255,255,0.25) solid 1px;
-        box-shadow: rgba(0,0,0,0.07) 0px 1px 2px, rgba(0,0,0,0.07) 0px 2px 4px, rgba(0,0,0,0.07) 0px 4px 8px;
+        border: rgba(255,255,255,0.16) solid 1px;
+        box-shadow: rgba(0,0,0,0.08) 0px 2px 6px;
         cursor: pointer;
-        color: #aaaaaa;
-        font-size: 16px;
+        color: #bdbdbd;
+        font-size: 13px;
       }
-      .abdm-media-header .appIcon,
       .abdm-media-header .title-wrapper,
       .abdm-media-header .abdm-media-close-btn {
         display: flex;
@@ -72,24 +112,36 @@ function createPopup() {
       }
       .abdm-media-list {
         background: linear-gradient(to bottom right, #2E3038, #171820);
-        border: rgba(255,255,255,0.25) solid 1px;
-        border-radius: 16px;
+        border: rgba(255,255,255,0.18) solid 1px;
+        border-radius: 12px;
         overflow: auto;
-        color: #ccc;
-        font-size: 14px;
-        box-shadow: rgba(0,0,0,0.15) 0px 4px 10px;
-        margin-top: 4px;
+        color: #d0d0d0;
+        font-size: 12px;
+        box-shadow: rgba(0,0,0,0.14) 0px 6px 14px;
+        margin-top: 6px;
         display: none; /* start hidden */
-        max-height: 50vh; /* scroll if too long */
+        max-height: 40vh; /* slightly smaller */
+      }
+      .abdm-pinned .abdm-media-list,
+      .abdm-extension[data-pinned-mode="1"] .abdm-media-list {
+        position: absolute;
+        left: 0;
+        top: calc(100% + 6px);
+        width: 100%;
+        margin-top: 0;
       }
       .abdm-media-item {
-        padding: 8px 12px;
-        border-bottom: rgba(255,255,255,0.1) solid 1px;
+        padding: 5px 8px;
+        border-bottom: rgba(255,255,255,0.08) solid 1px;
         cursor: pointer;
         display: flex;
         flex-direction: column;
         align-items: start;
-        min-width: 160px;
+        min-width: 120px;
+      }
+      .abdm-media-item.selected {
+        outline: 2px solid rgba(77,196,254,0.18);
+        background: rgba(77,196,254,0.04);
       }
       .abdm-media-item:last-child {
         border-bottom: none;
@@ -99,11 +151,12 @@ function createPopup() {
       }
       .abdm-item-title {
         font-weight: 500;
-        color: #fff;
+        color: #f7f7f7;
+        font-size: 13px;
       }
       .abdm-item-details {
-        font-size: 12px;
-        opacity: 0.7;
+        font-size: 11px;
+        opacity: 0.72;
       }
     `
     wrapper.appendChild(styleEl)
@@ -143,33 +196,156 @@ function createPopup() {
     }
 
     const header = wrapper.querySelector<HTMLDivElement>(".abdm-media-header")!
+    // subtle hover/click animations for the header (animated long control)
+    header.style.transition = 'transform 160ms ease, box-shadow 120ms ease, background 120ms ease, color 120ms ease'
+    header.addEventListener('mouseenter', () => {
+      header.style.transform = 'translateY(-3px) scale(1.006)'
+      header.style.background = 'linear-gradient(135deg,#C631FF,#4DC4FE)'
+      header.style.boxShadow = '0 8px 26px rgba(0,0,0,0.38)'
+      header.style.color = '#fff'
+    })
+    header.addEventListener('mouseleave', () => {
+      header.style.transform = 'translateY(0) scale(1)'
+      header.style.background = 'linear-gradient(to bottom right, #2E3038, #171820)'
+      header.style.boxShadow = ''
+      header.style.color = '#aaaaaa'
+    })
+    header.addEventListener('mousedown', () => {
+      header.style.transform = 'translateY(-1px) scale(0.985)'
+    })
+    header.addEventListener('mouseup', () => {
+      if (header.matches(':hover')) {
+        header.style.transform = 'translateY(-3px) scale(1.006)'
+      } else {
+        header.style.transform = 'translateY(0) scale(1)'
+      }
+    })
     const listContainer = wrapper.querySelector<HTMLDivElement>(".abdm-media-list")!
 
     header.addEventListener("click", (e) => {
         if ((e.target as HTMLElement).classList.contains("abdm-media-close-btn")) return
         listVisible = !listVisible
         listContainer.style.display = listVisible ? "block" : "none"
+        pinnedPositionUpdater?.()
     })
 
     wrapper.querySelector<HTMLSpanElement>(".abdm-media-close-btn")!.onclick = () => {
-        dismissed = true
-        wrapper.remove()
-        popupEl = null
+      // remove current popup; allow future popups to re-create
+      keepPopupOpen = false
+      pinnedMode = false
+      clearPopupHide()
+      // overlays removed earlier; nothing to clear
+      wrapper.remove()
+      popupEl = null
     }
 
     document.body.appendChild(wrapper)
+    // keep popup on top and manage hide on leave
+    wrapper.addEventListener('mouseenter', () => { clearPopupHide() })
+    wrapper.addEventListener('mouseleave', () => { if (!keepPopupOpen && !pinnedPopupEl) schedulePopupHide() })
     popupEl = wrapper
     return wrapper
 }
 
-function getBiggestMediaPlayer() {
-    return Array.from(document.querySelectorAll<HTMLMediaElement>("video, audio"))
-        .filter(el => el instanceof HTMLVideoElement || el instanceof HTMLAudioElement)
-        .sort((a, b) => {
-            const areaA = a.clientWidth * a.clientHeight
-            const areaB = b.clientWidth * b.clientHeight
-            return areaB - areaA
-        })[0] || null
+function createPinnedPopup() {
+  if (pinnedPopupEl) return pinnedPopupEl
+  const base = createPopup()
+  // clone but mark as pinned to separate hide/show logic
+  const pinned = base.cloneNode(true) as HTMLDivElement
+  pinned.classList.add('abdm-pinned')
+  pinned.setAttribute('data-pinned-mode', '1')
+  // smaller, compact style for pinned
+  pinned.style.width = ''
+  pinned.style.maxWidth = '320px'
+  document.body.appendChild(pinned)
+  // Pinned popup should NOT auto-hide on mouseleave
+  pinned.addEventListener('mouseenter', () => { clearPopupHide() })
+  pinnedPopupEl = pinned
+  
+  // Re-attach close button listener for the cloned element
+  const closeBtn = pinned.querySelector<HTMLElement>(".abdm-media-close-btn")
+  if (closeBtn) {
+    closeBtn.onclick = () => {
+      keepPopupOpen = false
+      pinnedMode = false
+      clearPopupHide()
+      pinned.remove()
+      pinnedPopupEl = null
+      cleanupPinnedState()
+    }
+  }
+
+  return pinned
+}
+
+function cleanupPinnedState() {
+  if (pinnedObserver) {
+    pinnedObserver.disconnect()
+    pinnedObserver = null
+  }
+  if (pinnedScrollHandler) {
+    window.removeEventListener("scroll", pinnedScrollHandler, true)
+    window.removeEventListener("resize", pinnedScrollHandler)
+    pinnedScrollHandler = null
+  }
+  pinnedPositionUpdater = null
+  pinnedAnchorEl = null
+  pinnedMode = false
+}
+
+function getAllMediaPlayers() {
+  const includeImages = (() => {
+    try { return Configs.getLatestConfig().registeredFileTypes.includes('img') } catch(e) { return false }
+  })()
+  const selector = includeImages ? "video, audio, img" : "video, audio"
+  return Array.from(document.querySelectorAll<HTMLElement>(selector))
+    .filter(el => (el instanceof HTMLVideoElement || el instanceof HTMLAudioElement || (includeImages && el instanceof HTMLImageElement)))
+    .filter(el => el.offsetWidth > 24 && el.offsetHeight > 24 && el.isConnected)
+}
+
+function getBiggestMediaPlayer(onlyVisible = true) {
+  const candidates = getAllMediaPlayers()
+    .filter(el => {
+      if (!onlyVisible) return true
+      const r = el.getBoundingClientRect()
+      return r.width > 24 && r.height > 24 && r.bottom >= 0 && r.top <= window.innerHeight && r.right >= 0 && r.left <= window.innerWidth
+    })
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))
+  return candidates[0] || null
+}
+
+function choosePinnedAnchor(items: DownloadableMedia[], preferred?: HTMLElement | null) {
+  if (preferred?.isConnected) {
+    return preferred
+  }
+  if (pinnedAnchorEl?.isConnected) {
+    return pinnedAnchorEl
+  }
+  const mediaEls = getAllMediaPlayers()
+  if (mediaEls.length === 0) {
+    return null
+  }
+  const itemUris = new Set(items.map(item => item.uri.toLowerCase()))
+  const exact = mediaEls.find((el) => {
+    const src = (el instanceof HTMLImageElement) ? (el.currentSrc || el.src) : ((el as HTMLMediaElement).currentSrc || (el as HTMLMediaElement).src)
+    return !!src && itemUris.has(src.toLowerCase())
+  })
+  if (exact) {
+    return exact
+  }
+  const activeMedia = mediaEls.find((el) => el instanceof HTMLVideoElement && !el.paused && !el.ended)
+  if (activeMedia) {
+    return activeMedia
+  }
+  if (mediaEls.length === 1) {
+    return mediaEls[0]
+  }
+  const biggestVisible = getBiggestMediaPlayer(true)
+  if (biggestVisible) {
+    return biggestVisible
+  }
+  return getBiggestMediaPlayer(false)
 }
 
 /**
@@ -182,16 +358,32 @@ export function setItemClickListener(callback: (item: DownloadableMedia) => void
 /**
  * Update the popup with a list of media items
  */
-export function updatePopup(items: DownloadableMedia[]) {
-    if (dismissed) return
+export function updatePopup(items: DownloadableMedia[], anchorEl?: HTMLElement | null, forcePinned = false) {
+
+    if (pinnedMode && !forcePinned) {
+      return
+    }
 
     if (!items || items.length === 0) {
-        popupEl?.remove()
-        popupEl = null
+      if (pinnedMode && (popupEl || pinnedPopupEl)) {
         return
+      }
+      popupEl?.remove()
+      popupEl = null
+      cleanupPinnedState()
+      pinnedPopupEl?.remove()
+      pinnedPopupEl = null
+      return
     }
 
     const popup = createPopup()
+    if (forcePinned) {
+      keepPopupOpen = true
+      pinnedMode = true
+      popup.setAttribute('data-pinned-mode', '1')
+    } else {
+      popup.removeAttribute('data-pinned-mode')
+    }
 
     const countEl = popup.querySelector<HTMLSpanElement>(".count-text")!
     countEl.textContent = String(items.length)
@@ -219,24 +411,333 @@ export function updatePopup(items: DownloadableMedia[]) {
 
         el.onclick = () => {
             onItemClick?.(item)
+            // keep the popup visible after selection
+            keepPopupOpen = true
+            try {
+              const prev = listContainer.querySelector<HTMLDivElement>('.abdm-media-item.selected')
+              if (prev) prev.classList.remove('selected')
+            } catch(e) {}
+            el.classList.add('selected')
         }
 
         listContainer.appendChild(el)
     }
 
-    // Position near video/audio or fallback top-left
-    const media = getBiggestMediaPlayer()
-    if (media) {
-        const rect = media.getBoundingClientRect()
-        popup.style.position = "absolute" // near media
-        popup.style.top = `${Math.max(rect.top - popup.offsetHeight - 2 + window.scrollY, 2)}px`
-        popup.style.left = `${rect.left + window.scrollX}px`
+    // Position near provided anchor, nearest large media, or fallback top-left
+    const anchor = forcePinned
+      ? choosePinnedAnchor(items, anchorEl)
+      : (anchorEl || getBiggestMediaPlayer(true) || getBiggestMediaPlayer(false))
+    // Ensure popup is measurable: show it invisibly first
+    popup.style.visibility = 'hidden'
+    popup.style.display = 'flex'
+    const popupW = popup.offsetWidth || 240
+    const popupH = popup.offsetHeight || 120
+    popup.style.visibility = 'visible'
+
+    if (anchor) {
+      const clamp = (v: number, a: number, b: number) => Math.min(Math.max(v, a), b)
+      const getPinnedPosition = (target: HTMLElement, elementWidth: number, anchorHeight: number) => {
+        const rect = target.getBoundingClientRect()
+        const desiredLeft = Math.round(rect.left)
+        const desiredTop = Math.round(rect.top - anchorHeight)
+        return {
+          rect,
+          left: clamp(desiredLeft, 0, Math.max(0, window.innerWidth - elementWidth)),
+          top: clamp(desiredTop, 0, Math.max(0, window.innerHeight - anchorHeight)),
+        }
+      }
+
+      if (forcePinned) {
+        const positionMainPopup = () => {
+          if (!popupEl) {
+            return
+          }
+          if (!pinnedAnchorEl?.isConnected) {
+            pinnedAnchorEl = choosePinnedAnchor(items, anchorEl)
+          }
+          if (!pinnedAnchorEl) {
+            popupEl.style.position = 'fixed'
+            popupEl.style.left = '0px'
+            popupEl.style.top = '0px'
+            popupEl.style.display = 'none'
+            return
+          }
+          popupEl.style.position = 'fixed'
+          popupEl.style.visibility = 'hidden'
+          const headerHeight = popupEl.querySelector<HTMLElement>(".abdm-media-header")?.offsetHeight || 36
+          const {rect, left, top} = getPinnedPosition(
+              pinnedAnchorEl,
+              popupEl.offsetWidth || popupW,
+              headerHeight,
+          )
+          const visible = rect.width > 0 && rect.height > 0 && rect.bottom >= 0 && rect.top <= window.innerHeight
+          popupEl.style.display = visible ? 'flex' : 'none'
+          if (!visible) {
+            popupEl.style.visibility = 'visible'
+            return
+          }
+          popupEl.style.left = `${left}px`
+          popupEl.style.top = `${top}px`
+          popupEl.style.visibility = 'visible'
+          const pr = popupEl.getBoundingClientRect()
+          blindZoneRect = {
+            left: pr.left - blindZoneRadius,
+            top: pr.top - blindZoneRadius,
+            right: pr.right + blindZoneRadius,
+            bottom: pr.bottom + blindZoneRadius,
+          }
+        }
+        cleanupPinnedState()
+        pinnedMode = true
+        pinnedAnchorEl = anchor
+        pinnedPositionUpdater = positionMainPopup
+        positionMainPopup()
+        pinnedObserver = new IntersectionObserver((entries) => {
+          for (const e of entries) {
+            if (popupEl && e.target === pinnedAnchorEl) {
+              positionMainPopup()
+            }
+          }
+        }, { root: null, threshold: 0.1 })
+        try {
+          pinnedObserver.observe(pinnedAnchorEl)
+        } catch (e) {
+          // ignore if observe fails
+        }
+        pinnedScrollHandler = () => positionMainPopup()
+        window.addEventListener("scroll", pinnedScrollHandler, true)
+        window.addEventListener("resize", pinnedScrollHandler)
+        return
+      } else if (!anchorEl) {
+        const pinned = createPinnedPopup()
+        pinned.style.visibility = 'hidden'
+        pinned.style.display = 'flex'
+        const pw = pinned.offsetWidth || popupW
+        const ph = pinned.offsetHeight || popupH
+        pinned.style.visibility = 'visible'
+
+        const positionPinnedPopup = () => {
+          if (!pinnedPopupEl) {
+            return
+          }
+          if (!pinnedAnchorEl?.isConnected) {
+            pinnedAnchorEl = choosePinnedAnchor(items, null)
+          }
+          if (!pinnedAnchorEl) {
+            pinnedPopupEl.style.left = `0px`
+            pinnedPopupEl.style.top = `0px`
+            pinnedPopupEl.style.display = 'none'
+            return
+          }
+          pinnedPopupEl.style.visibility = 'hidden'
+          const headerHeight = pinnedPopupEl.querySelector<HTMLElement>(".abdm-media-header")?.offsetHeight || 36
+          const {rect, left, top} = getPinnedPosition(
+              pinnedAnchorEl,
+              pinnedPopupEl.offsetWidth || pw,
+              headerHeight,
+          )
+          const visible = rect.width > 0 && rect.height > 0 && rect.bottom >= 0 && rect.top <= window.innerHeight
+          pinnedPopupEl.style.display = visible ? 'flex' : 'none'
+          if (!visible) {
+            pinnedPopupEl.style.visibility = 'visible'
+            return
+          }
+          pinnedPopupEl.style.left = `${left}px`
+          pinnedPopupEl.style.top = `${top}px`
+          pinnedPopupEl.style.visibility = 'visible'
+          const pr = pinnedPopupEl.getBoundingClientRect()
+          blindZoneRect = {
+            left: pr.left - blindZoneRadius,
+            top: pr.top - blindZoneRadius,
+            right: pr.right + blindZoneRadius,
+            bottom: pr.bottom + blindZoneRadius,
+          }
+        }
+
+        pinned.style.position = 'fixed'
+        cleanupPinnedState()
+        pinnedAnchorEl = anchor
+        pinnedPositionUpdater = positionPinnedPopup
+        positionPinnedPopup()
+        pinnedObserver = new IntersectionObserver((entries) => {
+          for (const e of entries) {
+            if (pinnedPopupEl && e.target === pinnedAnchorEl) {
+              positionPinnedPopup()
+            }
+          }
+        }, { root: null, threshold: 0.1 })
+        try {
+          pinnedObserver.observe(pinnedAnchorEl)
+        } catch (e) {
+          // ignore if observe fails
+        }
+        pinnedScrollHandler = () => positionPinnedPopup()
+        window.addEventListener("scroll", pinnedScrollHandler, true)
+        window.addEventListener("resize", pinnedScrollHandler)
+        return
+      } else {
+        const {left, top} = getPinnedPosition(anchor, popupW, popupH)
+        popup.style.top = `${top}px`
+        popup.style.left = `${left}px`
+        // update blind zone to avoid snapping back to elements overlapping the popup
+        const pr = popup.getBoundingClientRect()
+        blindZoneRect = {
+          left: pr.left - blindZoneRadius,
+          top: pr.top - blindZoneRadius,
+          right: pr.right + blindZoneRadius,
+          bottom: pr.bottom + blindZoneRadius,
+        }
+      }
     } else {
-        popup.style.position = "fixed"
-        popup.style.top = "8px"
-        popup.style.left = "8px"
+      cleanupPinnedState()
+      // Fallback: no anchor element found, position at top-left of viewport
+      popup.style.position = "fixed"
+      popup.style.top = "8px"
+      popup.style.left = "8px"
+      // set blind zone around top-left fallback
+      const pr = popup.getBoundingClientRect()
+      blindZoneRect = {
+        left: pr.left - blindZoneRadius,
+        top: pr.top - blindZoneRadius,
+        right: pr.right + blindZoneRadius,
+        bottom: pr.bottom + blindZoneRadius,
+      }
     }
 }
+
+  function findNearestLargeMedia(x: number, y: number, maxDistance = 250): HTMLElement | null {
+    const includeImages = (() => {
+        try { return Configs.getLatestConfig().registeredFileTypes.includes('img') } catch(e) { return false }
+    })()
+    const selector = includeImages ? "video, audio, img" : "video, audio"
+    const els = Array.from(document.querySelectorAll<HTMLElement>(selector))
+      .filter(e => e.offsetWidth > 24 && e.offsetHeight > 24)
+    let best: {el: HTMLElement, dist: number} | null = null
+    for (const el of els) {
+      // ignore elements that are part of our extension UI
+      if (popupEl && popupEl.contains(el)) continue
+      if (el.closest && el.closest('.abdm-extension')) continue
+      if (el.closest && el.closest('[data-abdm-ignore]')) continue
+      // compute an expanded rect (vertically) to make it easier to keep the target
+      const r = el.getBoundingClientRect()
+      const expansion = Math.max(1, hoverExpansion)
+      const extra = (r.height * (expansion - 1)) / 2
+      const exTop = r.top - extra
+      const exBottom = r.bottom + extra
+      const exLeft = r.left
+      const exRight = r.right
+
+      // ignore elements inside blind zone (use expanded rect)
+      if (blindZoneRect) {
+        const intersects = !(exRight < blindZoneRect.left || exLeft > blindZoneRect.right || exBottom < blindZoneRect.top || exTop > blindZoneRect.bottom)
+        if (intersects) continue
+      }
+
+      // use expanded rect center for distance calculation so vertical expansion helps
+      const cx = (exLeft + exRight) / 2
+      const cy = (exTop + exBottom) / 2
+      const dx = cx - x
+      const dy = cy - y
+      const dist = Math.sqrt(dx*dx + dy*dy)
+      if (dist <= maxDistance && (!best || dist < best.dist)) best = {el, dist}
+    }
+    return best ? best.el : null
+  }
+
+  function debounce(fn: (...args: any[]) => void, wait = 200) {
+    let t: number | null = null
+    return (...args: any[]) => {
+      if (t) window.clearTimeout(t)
+      // @ts-ignore
+      t = window.setTimeout(() => fn(...args), wait)
+    }
+  }
+
+  /**
+   * Initialize hover-based detection: when mouse moves near a large media element
+   * request media info from background and show popup anchored to that element.
+   */
+  export function initHoverDetector() {
+    const onMove = debounce(async (ev: MouseEvent) => {
+      const targetEl = ev.target as HTMLElement | null
+      if (targetEl?.closest?.('.abdm-extension') || targetEl?.closest?.('[data-abdm-ignore]')) {
+        return
+      }
+      if (!hoverEnabled) return
+      if (pinnedMode) return
+      // Skip blacklisted pages entirely — don't show synthetic fallback media
+      if (isUrlBlacklisted(location.href)) return
+      // small movement guard to avoid frequent re-evaluations
+      if (lastMouseX !== null && lastMouseY !== null) {
+        const dx = ev.clientX - lastMouseX
+        const dy = ev.clientY - lastMouseY
+        if (Math.sqrt(dx*dx + dy*dy) < moveThreshold) return
+      }
+      lastMouseX = ev.clientX
+      lastMouseY = ev.clientY
+      const x = ev.clientX
+      const y = ev.clientY
+      const target = findNearestLargeMedia(x, y)
+      if (!target) {
+        // Don't clear lastHoverTarget immediately; allow a short grace so small mouse
+        // movements don't make the UI vanish. This avoids losing popup when cursor
+        // briefly leaves the element.
+        if (hoverClearTimeout) window.clearTimeout(hoverClearTimeout)
+        hoverClearTimeout = window.setTimeout(() => {
+          lastHoverTarget = null
+          // Keep an existing popup visible instead of collapsing it the moment playback starts.
+          if (!popupEl && !pinnedPopupEl) {
+            schedulePopupHide()
+          }
+          hoverClearTimeout = null
+        }, hoverGraceMs)
+        return
+      }
+      if (hoverClearTimeout) { window.clearTimeout(hoverClearTimeout); hoverClearTimeout = null }
+      // Clear any pending popup hide scheduled from a previous hover, since we have a new target.
+      clearPopupHide();
+
+      if (lastHoverTarget === target) return
+      lastHoverTarget = target
+      // try to extract candidate URLs from element
+      let candidate: string | undefined
+      if (target instanceof HTMLVideoElement || target instanceof HTMLAudioElement) {
+        candidate = (target as HTMLMediaElement).currentSrc || (target as HTMLMediaElement).src
+      } else if (target instanceof HTMLImageElement) {
+        candidate = (target as HTMLImageElement).currentSrc || (target as HTMLImageElement).src
+      }
+      try {
+        const msg = { type: 'hover_near_media', url: candidate }
+        const resp = await browser.runtime.sendMessage(msg as any)
+        if (resp && Array.isArray(resp.items) && resp.items.length > 0) {
+          // show the main popup anchored to the media element
+          try { updatePopup(resp.items as DownloadableMedia[], target) } catch (e) {}
+          return
+        }
+      } catch (e) {
+        // background may not handle this message; ignore and fallback
+      }
+      // Only synthesize a temporary candidate if we don't already have a real anchored popup.
+      if (candidate && !popupEl && !pinnedPopupEl && !pinnedMode) {
+        const extMatch = candidate.match(/\.([a-z0-9]{2,6})(?:\?|$)/i)
+        const extension = extMatch ? extMatch[1] : undefined
+        const synthetic: DownloadableMedia = {
+          uri: candidate,
+          displayName: candidate.split('/').pop() || candidate,
+          extension,
+          type: 'unknown',
+        } as any
+        try { updatePopup([synthetic], target) } catch (e) {}
+      }
+    }, 180)
+
+    document.addEventListener('mousemove', onMove)
+  }
+
+  export function disableHover() { hoverEnabled = false }
+  export function enableHover() { hoverEnabled = true }
+
+  // no overlay positioning necessary after removing small overlay controls
 
 /**
  * Toggle the visibility of the list manually
@@ -255,4 +756,5 @@ export function toggleList(
             listVisible = visible
     }
     listContainer.style.display = listVisible ? "block" : "none"
+    pinnedPositionUpdater?.()
 }

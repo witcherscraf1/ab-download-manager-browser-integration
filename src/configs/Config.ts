@@ -50,6 +50,7 @@ export const defaultConfig: Config = {
         "pdf",
         "mp4", "3gp", "avi", "mkv", "wav", "mpeg",
         "srt",
+        "m3u8",
     ],
     blacklistedUrls: [],
     allowPassDownloadIfAppNotRespond: true,

@@ -25,5 +25,8 @@ export function isMediaPlayListEncrypted(playlist: MediaPlaylist) {
 export const HLS_CONTENT_TYPES = [
     "application/x-mpegurl",
     "application/vnd.apple.mpegurl",
+    "audio/mpegurl",
+    "audio/x-mpegurl",
+    "application/mpegurl",
 ]
 export const MAX_HLS_PLAYLIST_SIZE = 2 * 1024 * 1024 // 2MiB
